@@ -2,7 +2,10 @@
 
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestConservativeConfiguration(t *testing.T) {
 	base := Default()
@@ -43,5 +46,27 @@ func TestConservativeConfiguration(t *testing.T) {
 	}
 	if err := ValidateRuntimePolicy(base); err == nil {
 		t.Fatal("empty API key accepted at runtime")
+	}
+}
+
+func TestConservativeReportsInvalidWorkerSetting(t *testing.T) {
+	for key, change := range map[string]func(*Config){
+		"WAA_BACKEND":              func(c *Config) { c.WAABackend = WAABackendSpiderMonkey },
+		"FIRST_EVENT_HEDGE":        func(c *Config) { c.FirstEventHedge = "auto" },
+		"PER_ACCOUNT_CONCURRENCY":  func(c *Config) { c.PerAccountConcurrency = 2 },
+		"MAX_ACTIVE_WORKERS":       func(c *Config) { c.MaxActiveWorkers = 2 },
+		"WARM_STARTUP_CONCURRENCY": func(c *Config) { c.WarmStartupConcurrency = 2 },
+		"WARM_WORKER_LIMIT":        func(c *Config) { c.WarmWorkerLimit = 2 },
+	} {
+		t.Run(key, func(t *testing.T) {
+			cfg := Default()
+			cfg.AdminPassword = "fixture-management-secret"
+			cfg.ProxyAPIKey = "fixture-key"
+			change(&cfg)
+			err := ValidateRuntimePolicy(cfg)
+			if err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("expected actionable %s error, got %v", key, err)
+			}
+		})
 	}
 }

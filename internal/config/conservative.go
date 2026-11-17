@@ -21,8 +21,19 @@ func validateConservative(c Config) error {
 	if !c.AdminAuthEnabled || strings.TrimSpace(c.AdminPassword) == "" {
 		return fmt.Errorf("conservative trial requires separate management authentication")
 	}
-	if c.WAABackend != WAABackendCamoufox || c.FirstEventHedge != FirstEventHedgeOff || c.PerAccountConcurrency != 1 || c.MaxActiveWorkers != 1 || c.WarmStartupConcurrency != 1 || c.WarmWorkerLimit > 1 {
-		return fmt.Errorf("conservative trial requires one browser worker, one concurrent request and no hedging")
+	switch {
+	case c.WAABackend != WAABackendCamoufox:
+		return fmt.Errorf("conservative trial requires WAA_BACKEND=camoufox")
+	case c.FirstEventHedge != FirstEventHedgeOff:
+		return fmt.Errorf("conservative trial requires FIRST_EVENT_HEDGE=off")
+	case c.PerAccountConcurrency != 1:
+		return fmt.Errorf("conservative trial requires PER_ACCOUNT_CONCURRENCY=1")
+	case c.MaxActiveWorkers != 1:
+		return fmt.Errorf("conservative trial requires MAX_ACTIVE_WORKERS=1")
+	case c.WarmStartupConcurrency != 1:
+		return fmt.Errorf("conservative trial requires WARM_STARTUP_CONCURRENCY=1")
+	case c.WarmWorkerLimit > 1:
+		return fmt.Errorf("conservative trial requires WARM_WORKER_LIMIT<=1")
 	}
 	if c.RequestBodyLog || c.FakeStream || c.StripThoughtSignatures || c.ContinuationRewrite || len(c.UpstreamChannels) != 1 || c.UpstreamChannels[0] != "playground" {
 		return fmt.Errorf("conservative trial requires native Playground responses and disabled body logging")
