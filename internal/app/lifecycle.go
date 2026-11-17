@@ -198,6 +198,10 @@ func (manager *runtimeManager) startService(ctx context.Context) (api.AdminStatu
 		manager.finishStart(launchCancel)
 		return api.AdminStatus{}, err
 	}
+	if err := config.ValidateRuntimePolicy(cfg); err != nil {
+		manager.finishStart(launchCancel)
+		return api.AdminStatus{}, err
+	}
 
 	next := current
 	release := func() {}
