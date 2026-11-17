@@ -1881,7 +1881,7 @@ func (service *trackedService) Generate(ctx context.Context, request aistudio.Ge
 		return nil, err
 	}
 	events := make(chan aistudio.Event, 8)
-	go service.generateWithRetry(ctx, requestCtx, cancel, generationStartedAt, request, resourceID, events)
+	go service.generateWithRetry(ctx, requestCtx, cancel, generationStartedAt, request, resourceID, events, service.acquireWarmLease)
 	return events, nil
 }
 
@@ -1949,6 +1949,8 @@ type attemptOutcome struct {
 	accountLabel  string
 }
 
+type warmLeaseAcquirer func(context.Context, aistudio.AccountSelection, bool, *int, *time.Duration) (*aistudio.AccountLease, error)
+
 func (service *trackedService) generateWithRetry(
 	clientCtx context.Context,
 	requestCtx context.Context,
@@ -1957,6 +1959,7 @@ func (service *trackedService) generateWithRetry(
 	request aistudio.GenerateRequest,
 	resourceID string,
 	destination chan<- aistudio.Event,
+	acquire warmLeaseAcquirer,
 ) {
 	requestedAccountID := strings.TrimSpace(request.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
@@ -1982,7 +1985,8 @@ func (service *trackedService) generateWithRetry(
 	var activity *upstreamActivity
 	var err error
 	copyFiles := false
-	for attempt := 0; attempt < retry.maxAttempts && generationAttemptAllowed(attempt, err); attempt++ {
+	// Account and file selection before startAttempt do not consume a generation attempt.
+	for attempt := 0; attempt < retry.maxAttempts && generationAttemptAllowed(attempt, err); {
 		selectionAccountID := requestedAccountID
 		recoveringAccount := retry.recoveryAccountID != ""
 		if retry.recoveryAccountID != "" {
@@ -2039,14 +2043,14 @@ func (service *trackedService) generateWithRetry(
 			service.requests.logRequestProgress(request.ID, "request", "WARN", "排队等待", "waited", waited, "model", modelID)
 		})
 		quotaFallback := selection.ResourceID == ""
-		lease, acquireErr := service.acquireWarmLease(requestCtx, selection, quotaFallback, &retry.failures, &retry.cooled)
+		lease, acquireErr := acquire(requestCtx, selection, quotaFallback, &retry.failures, &retry.cooled)
 		var buildCooling *aistudio.AllCoolingError
 		if acquireErr != nil && selection.Channel == aistudio.ChannelBuild && requestCtx.Err() == nil && !aistudio.RequestBuildOnly(request) &&
 			(errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &buildCooling)) {
 			// 没有账户能经 Build 服务时改用 Playground，Playground 无法表达的设置按其最接近的形式发送
 			selection.Channel = ""
 			fallbackReason = "Build 通道没有可用账户"
-			lease, acquireErr = service.acquireWarmLease(requestCtx, selection, quotaFallback, &retry.failures, &retry.cooled)
+			lease, acquireErr = acquire(requestCtx, selection, quotaFallback, &retry.failures, &retry.cooled)
 		}
 		queueDelayed := queueWait.finish()
 		if acquireErr == nil && selection.PreferredChannel == aistudio.ChannelBuild && lease.Channel() != aistudio.ChannelBuild {
@@ -2091,6 +2095,7 @@ func (service *trackedService) generateWithRetry(
 			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "排队结束", "waited", time.Since(queueStartedAt))
 		}
 		service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "等待上游响应")
+		attempt++
 		primary := service.startAttempt(requestCtx, request, resourceID, modelID, fallbackReason, lease, selection, false, retry.failures)
 		var plan *hedgePlan
 		if hedgeable && !hedged {
@@ -2159,7 +2164,7 @@ func (service *trackedService) generateWithRetry(
 			delete(retry.attempted, last.accountID)
 			retry.maxAttempts++
 		}
-		if attempt+1 == retry.maxAttempts {
+		if attempt == retry.maxAttempts {
 			if service.retryRejectedAccount(request.ID, modelID, retry, err) {
 				continue
 			}
