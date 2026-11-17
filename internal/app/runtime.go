@@ -844,12 +844,11 @@ func (service *trackedService) syncAccountModels(ctx context.Context, accountID 
 
 // retryModelCatalogs 每 30 秒重新载入待同步账户的页面重试目录，自 startedAt 起每 24 小时重新载入启用账户的页面读取权益与目录；闲置的写代码助手应用与到期资源在启动时与每 10 分钟删除
 func (service *trackedService) retryModelCatalogs(ctx context.Context, startedAt time.Time) {
-	if buildpolicy.Conservative {
-		return
-	}
 	var patrol sync.WaitGroup
 	defer patrol.Wait()
-	patrol.Go(func() { service.patrolAccountStates(ctx, startedAt) })
+	if !buildpolicy.Conservative {
+		patrol.Go(func() { service.patrolAccountStates(ctx, startedAt) })
+	}
 	service.reclaimIdleAssistantApplets(ctx)
 	service.reclaimExpiredResources(ctx)
 	ticker := time.NewTicker(modelCatalogRetryInterval)
@@ -1828,7 +1827,7 @@ func (service *trackedService) generateWithRetry(
 	var activity *upstreamActivity
 	var err error
 	copyFiles := false
-	for attempt := 0; attempt < retry.maxAttempts && generationAttemptAllowed(attempt, retry.quotaRejected); attempt++ {
+	for attempt := 0; attempt < retry.maxAttempts && generationAttemptAllowed(attempt, err); attempt++ {
 		selectionAccountID := requestedAccountID
 		recoveringAccount := retry.recoveryAccountID != ""
 		if retry.recoveryAccountID != "" {
@@ -2038,8 +2037,14 @@ func (service *trackedService) generateWithRetry(
 	)
 }
 
-func generationAttemptAllowed(attempt int, quotaRejected bool) bool {
-	return !buildpolicy.Conservative || attempt == 0 || quotaRejected
+func generationAttemptAllowed(attempt int, lastError error) bool {
+	if !buildpolicy.Conservative || attempt == 0 {
+		return true
+	}
+	// Only the immediately preceding plan/daily rejection permits another account.
+	// An earlier quota failure must not authorize a later non-quota replay.
+	cooldown, quotaFailure := aistudio.QuotaCooldownForError(lastError, time.Now())
+	return quotaFailure && aistudio.RequestQuotaCooldown(cooldown.Reason)
 }
 
 // markAttemptAccount 把访问日志与活动请求的执行账户与通道记为该租约
