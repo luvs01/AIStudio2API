@@ -7,18 +7,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Mag1cFall/AIStudio2API/internal/waa/prooftime"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 )
 
-// GenerateTurn 是在页面界面运行的一轮 GenerateContent：Body 第 ProofStart 到 ProofEnd 字节是 proof 字段，发送时换成页面应用为 Digest 取得的 proof；Digest 为 binding 的 SHA-256 十六进制
+// GenerateTurn 是在页面界面运行的一轮 GenerateContent：Body 第 ProofStart 到 ProofEnd 字节是 proof 字段，发送时换成页面应用为 Digest 取得的 proof；Digest 为 binding 的 SHA-256 十六进制，Result 是最后一个 user 轮次为函数结果时官网用户在函数调用块中输入的函数结果，其余为空
 type GenerateTurn struct {
 	Body       []byte
 	ProofStart int
 	ProofEnd   int
 	Digest     string
+	Result     string
 }
 
 // chatTab 是运行界面对话的标签页
@@ -33,6 +35,8 @@ type chatTab struct {
 	resetting chan struct{}
 	// runHovered 表示后台新开对话后指针停在 Run 按钮上
 	runHovered bool
+	// unsent 表示输入框或函数响应输入框中留有已粘贴、页面没有发出的输入，下一轮全选后粘贴，原本要 Rerun 时先开新对话
+	unsent bool
 }
 
 // chatAction 是一轮界面对话在标签页上的操作
@@ -97,6 +101,46 @@ func GeneratePrompt(body []byte) (string, bool) {
 	return text, text != ""
 }
 
+// lastUserParts 返回 GenerateContent 正文最后一个轮次是 user 轮次时它的各 Part，否则为 nil
+func lastUserParts(body []byte) [][]json.RawMessage {
+	contents, err := generateContents(body)
+	if err != nil || len(contents) == 0 || contentRole(contents[len(contents)-1]) != "user" {
+		return nil
+	}
+	var turn []json.RawMessage
+	var parts [][]json.RawMessage
+	if json.Unmarshal(contents[len(contents)-1], &turn) != nil || len(turn) == 0 || json.Unmarshal(turn[0], &parts) != nil {
+		return nil
+	}
+	return parts
+}
+
+// GenerateAttachments 返回 GenerateContent 正文最后一个 user 轮次中内联数据、Drive 文件与外部媒体 Part 的个数，即官网用户在输入框中加入的附件数
+func GenerateAttachments(body []byte) int {
+	count := 0
+	for _, part := range lastUserParts(body) {
+		for _, index := range []int{2, 5, 6} {
+			if len(part) > index && !bytes.Equal(part[index], []byte("null")) {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+// GenerateFiles 返回 GenerateContent 正文最后一个 user 轮次中各 Drive 文件 Part 的文件 ID，顺序与正文相同
+func GenerateFiles(body []byte) []string {
+	var files []string
+	for _, part := range lastUserParts(body) {
+		var file []string
+		if len(part) > 5 && json.Unmarshal(part[5], &file) == nil && len(file) > 0 {
+			files = append(files, file[0])
+		}
+	}
+	return files
+}
+
 // nextChatAction 按标签页上一轮的 contents 判断本轮的操作：contents 相同时 Rerun，在上一轮后追加 model 与 user 两轮时继续当前对话，上一轮 contents 为空时在当前对话后直接输入，其余情况先开新对话
 func nextChatAction(previous, contents []json.RawMessage) chatAction {
 	if previous == nil {
@@ -122,7 +166,7 @@ func nextChatAction(previous, contents []json.RawMessage) chatAction {
 	return chatNew
 }
 
-// generateArmFunction 是在页面上为下一次 Run 安装一次性钩子的函数声明：官网高层 proof 函数下一次被调用时记下请求已开始并以本请求的 digest 取 proof，proof 返回后下一个 GenerateContent XHR 发送时把正文换成 head + proof + tail，并在该 XHR 上监听响应，经通道先发出带 proof 的 {sent: true, proof}，再依次发出响应头、正文块与结束标记；参数依次为页面对象、请求 ID、digest、head、tail 与通道
+// generateArmFunction 是在页面上为下一次 Run 安装一次性钩子的函数声明：官网高层 proof 函数下一次被调用时记下请求已开始并以本请求的 digest 取 proof，proof 返回后下一个 GenerateContent XHR 发送时把正文换成 head + proof + tail，并在该 XHR 上监听响应，经通道先发出带 proof 与取 proof 毫秒数的 {sent: true, proof, compute}，再依次发出响应头、正文块与结束标记；参数依次为页面对象、请求 ID、digest、head、tail 与通道
 const generateArmFunction = `(page, id, digest, head, tail, emit) => {
   const makerSuite = window.default_MakerSuite;
   const open = XMLHttpRequest.prototype.open;
@@ -138,7 +182,9 @@ const generateArmFunction = `(page, id, digest, head, tail, emit) => {
   makerSuite[page.key] = function(service) {
     makerSuite[page.key] = page.original;
     request.started = true;
+    const computeStarted = performance.now();
     return page.original.call(this, service, digest).then(proof => {
+      const compute = performance.now() - computeStarted;
       XMLHttpRequest.prototype.open = function(method, url) {
         if (String(url).endsWith("` + generateContentPath + `")) {
           XMLHttpRequest.prototype.open = open;
@@ -161,7 +207,7 @@ const generateArmFunction = `(page, id, digest, head, tail, emit) => {
               changed();
               request.resume?.();
             });
-            emit(JSON.stringify({sent: true, proof}));
+            emit(JSON.stringify({sent: true, proof, compute}));
             return send.call(xhr, head + JSON.stringify(proof) + tail);
           };
         }
@@ -179,20 +225,26 @@ const generateArmFunction = `(page, id, digest, head, tail, emit) => {
   };
 ` + protectedPump + `}`
 
-// Generate 像官网用户一样在标签页界面运行一轮 GenerateContent：按标签页上一轮的对话决定继续、Rerun 或先开新对话，输入框没有焦点时以可信指针点击输入框，写入最后一个 user 轮次文本的开头后点击 Run，页面应用自己取 proof、构造请求头并发出请求，发送时正文换成 turn 的正文；一轮成功完成后在后台新开对话，上游返回错误时下一轮在当前对话中继续；全部标签页都在运行对话时在新标签页中载入官网页面
+// Generate 像官网用户一样在标签页界面运行一轮 GenerateContent：按标签页上一轮的对话决定继续、Rerun 或先开新对话，输入框没有焦点时以可信指针点击输入框，写入最后一个 user 轮次文本的开头后点击 Run，页面应用自己取 proof、构造请求头并发出请求，发送时正文换成 turn 的正文；最后一个 user 轮次是函数结果时在最后一轮是其所回应函数调用的标签页中，于函数调用块中粘贴并提交；一轮成功完成后在后台新开对话（回答为函数调用时留在当前对话等函数结果），上游返回错误时下一轮在当前对话中继续；全部标签页都在运行对话时在新标签页中载入官网页面
 func (worker *Worker) Generate(ctx context.Context, turn GenerateTurn) (*ProtectedResponse, error) {
 	contents, err := generateContents(turn.Body)
 	if err != nil {
 		return nil, err
 	}
 	prompt, ok := GeneratePrompt(turn.Body)
-	if !ok {
-		return nil, errors.New("GenerateContent 最后一个轮次不是带文本的 user 轮次")
+	if !ok && turn.Result == "" {
+		return nil, errors.New("GenerateContent 最后一个轮次不是带文本或函数结果的 user 轮次")
 	}
-	tab, err := worker.acquireChat(ctx)
-	if err != nil {
+	lockStarted := time.Now()
+	var tab *chatTab
+	if turn.Result != "" {
+		if tab, err = worker.acquireFunctionChat(contents); err != nil {
+			return nil, err
+		}
+	} else if tab, err = worker.acquireChat(ctx); err != nil {
 		return nil, err
 	}
+	prooftime.Observe(ctx, prooftime.Lock, time.Since(lockStarted))
 	response, err := worker.generate(ctx, tab, turn, contents, prompt)
 	if err != nil {
 		worker.releaseChat(tab, false)
@@ -217,13 +269,17 @@ func (worker *Worker) generate(ctx context.Context, tab *chatTab, turn GenerateT
 		unboost()
 		return nil, worker.abandonProtectedRequest(ctx, tab.contextID, tab.page, requestID, err)
 	}
-	proof, err := worker.waitSent(ctx, tab, requestID, channel)
+	sendStarted := time.Now()
+	proof, compute, err := worker.waitSent(ctx, tab, requestID, channel)
 	unboost()
 	if err != nil {
 		return nil, worker.abandonProtectedRequest(ctx, tab.contextID, tab.page, requestID, fmt.Errorf("等待页面应用发出 GenerateContent: %w", err))
 	}
+	prooftime.Observe(ctx, prooftime.Compute, compute)
+	prooftime.Observe(ctx, prooftime.Interaction, time.Since(sendStarted)-compute)
 	worker.mu.Lock()
 	tab.contents = contents
+	tab.unsent = false
 	worker.mu.Unlock()
 	status, header, err := readResponseHead(ctx, channel)
 	if err != nil {
@@ -242,16 +298,20 @@ func (worker *Worker) generate(ctx context.Context, tab *chatTab, turn GenerateT
 		Proof:      proof,
 		Body: &protectedResponseBody{
 			ctx: bodyCtx, cancel: cancelBody, worker: worker, contextID: tab.contextID, page: tab.page, requestID: requestID, channel: channel,
-			stop: func() error { return worker.stopTurn(tab) }, release: func(done bool) { worker.releaseChat(tab, done && status == http.StatusOK) },
+			stop: func() error { return worker.stopTurn(tab) }, release: func(done, call bool) { worker.releaseChat(tab, done && status == http.StatusOK && !call) },
 		},
 	}, nil
 }
 
-// startTurn 在标签页上关闭页面启动后出现的已知弹层，完成本轮的界面输入（输入框没有焦点时先点击输入框），安装一次性钩子后点击 Run 或 Rerun，指针仍停在 Run 上时原地点击
+// startTurn 在标签页上关闭页面启动后出现的已知弹层，完成本轮的界面输入（输入框没有焦点时先点击输入框；函数结果在最后一轮的函数调用块中输入并提交），安装一次性钩子后点击 Run 或 Rerun，指针仍停在 Run 上时原地点击
 func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn GenerateTurn, contents []json.RawMessage, prompt string, requestID string) error {
 	client := worker.client
+	inputStarted := time.Now()
 	worker.lockInput()
 	defer worker.inputMu.Unlock()
+	locked := time.Now()
+	prooftime.Observe(ctx, prooftime.Lock, locked.Sub(inputStarted))
+	defer func() { prooftime.Observe(ctx, prooftime.Interaction, time.Since(locked)) }()
 	// input 是界面操作使用的上下文，请求取消只在两次操作之间生效，页面不会停在确认弹窗等操作中途
 	input := context.WithoutCancel(ctx)
 	if err := worker.selectChat(input, tab); err != nil {
@@ -267,7 +327,13 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 	action := nextChatAction(tab.contents, contents)
 	hovered := tab.runHovered
 	tab.runHovered = false
+	if tab.unsent && action == chatRerun {
+		action = chatNew
+	}
 	worker.mu.Unlock()
+	if turn.Result != "" {
+		return worker.submitResult(ctx, input, tab, turn, requestID)
+	}
 	if action == chatNew {
 		hovered = false
 		if err := worker.newChat(input, tab); err != nil {
@@ -288,16 +354,24 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 				return err
 			}
 		}
-		if err := fillPrompt(input, client, tab.contextID, promptHead(prompt)); err != nil {
+		worker.mu.Lock()
+		unsent := tab.unsent
+		tab.unsent = true
+		worker.mu.Unlock()
+		if unsent {
+			if err := pressKeys(input, client, tab.contextID, selectAllKeyActions); err != nil {
+				return fmt.Errorf("全选官网输入框中未发出的输入: %w", err)
+			}
+		}
+		if err := pastePrompt(input, client, tab.contextID, promptHead(prompt)); err != nil {
 			return err
 		}
 		if err := worker.waitRunnable(ctx, tab); err != nil {
 			return fmt.Errorf("等待官网 Run 按钮启用: %w", err)
 		}
 	}
-	head, tail := string(turn.Body[:turn.ProofStart]), string(turn.Body[turn.ProofEnd:])
-	if _, err := client.callFunction(ctx, tab.contextID, generateArmFunction, tab.page, requestID, turn.Digest, head, tail, bidiChannelArgument(requestID)); err != nil {
-		return fmt.Errorf("安装界面运行钩子: %w", err)
+	if err := worker.arm(ctx, tab, turn, requestID); err != nil {
+		return err
 	}
 	if action == chatRerun {
 		if _, err := client.pointer(input, tab.contextID, lastTurnSelector, "", false, pointerMoveDuration); err != nil {
@@ -313,6 +387,23 @@ func (worker *Worker) startTurn(ctx context.Context, tab *chatTab, turn Generate
 		move = 0
 	}
 	return worker.click(input, tab.contextID, runButtonSelector, "", "官网 Run 按钮", move)
+}
+
+// arm 在标签页上为下一次 Run 或提交安装 generateArmFunction 一次性钩子
+func (worker *Worker) arm(ctx context.Context, tab *chatTab, turn GenerateTurn, requestID string) error {
+	head, tail := string(turn.Body[:turn.ProofStart]), string(turn.Body[turn.ProofEnd:])
+	if _, err := worker.client.callFunction(ctx, tab.contextID, generateArmFunction, tab.page, requestID, turn.Digest, head, tail, bidiChannelArgument(requestID)); err != nil {
+		return fmt.Errorf("安装界面运行钩子: %w", err)
+	}
+	return nil
+}
+
+// selectAllKeyActions 是在有焦点的输入框按 Ctrl+A 全选的可信键盘动作
+var selectAllKeyActions = []map[string]any{
+	{"type": "keyDown", "value": "\uE009"}, {"type": "pause", "duration": 25},
+	{"type": "keyDown", "value": "a"}, {"type": "pause", "duration": 25}, {"type": "pause", "duration": 70},
+	{"type": "keyUp", "value": "a"}, {"type": "pause", "duration": 25},
+	{"type": "keyUp", "value": "\uE009"},
 }
 
 // promptFillLimit 是界面运行写入官网输入框的最多字符数，与官网把更长的粘贴转为文本附件的长度相同；页面发出时正文整体换成服务的正文
@@ -359,43 +450,43 @@ func (worker *Worker) waitRunnable(ctx context.Context, tab *chatTab) error {
 }
 
 // waitSent 等页面应用发出本轮 GenerateContent 并返回页面写入的 proof；页面忙于处理或已开始运行时随之等待，点击后页面空闲时持续没有开始运行或弹出对话框时以页面给出的原因失败
-func (worker *Worker) waitSent(ctx context.Context, tab *chatTab, requestID string, channel *bidiChannel) (string, error) {
+func (worker *Worker) waitSent(ctx context.Context, tab *chatTab, requestID string, channel *bidiChannel) (string, time.Duration, error) {
 	for checks := 1; ; checks++ {
 		pollCtx, cancel := context.WithTimeout(ctx, pagePollInterval)
 		message, err := readProtectedMessage(pollCtx, channel)
 		cancel()
 		if err != nil && (ctx.Err() != nil || !errors.Is(err, context.DeadlineExceeded)) {
-			return "", err
+			return "", 0, err
 		}
 		if err == nil {
 			return sentProof(message)
 		}
 		state, err := readRunState(ctx, worker.client, tab.contextID, tab.page, requestID)
 		if err != nil {
-			return "", err
+			return "", 0, err
 		}
 		if state.Started || state.Running {
 			message, err := readProtectedMessage(ctx, channel)
 			if err != nil {
-				return "", err
+				return "", 0, err
 			}
 			return sentProof(message)
 		}
 		if len(state.Dialogs) > 0 || checks == runSettleChecks {
-			return "", fmt.Errorf("点击 Run 后页面没有开始运行: %s", state.reason())
+			return "", 0, fmt.Errorf("点击 Run 后页面没有开始运行: %s", state.reason())
 		}
 	}
 }
 
-// sentProof 返回通道上第一条消息表示的发送结果，页面已发出 GenerateContent 时返回页面写入的 proof
-func sentProof(message protectedMessage) (string, error) {
+// sentProof 返回通道上第一条消息表示的发送结果，页面已发出 GenerateContent 时返回页面写入的 proof 与页面应用取 proof 的耗时
+func sentProof(message protectedMessage) (string, time.Duration, error) {
 	if message.Error != "" {
-		return "", errors.New(message.Error)
+		return "", 0, errors.New(message.Error)
 	}
 	if !message.Sent {
-		return "", errors.New("页面应用没有发出 GenerateContent")
+		return "", 0, errors.New("页面应用没有发出 GenerateContent")
 	}
-	return message.Proof, nil
+	return message.Proof, time.Duration(message.Compute * float64(time.Millisecond)), nil
 }
 
 // newChat 点击顶栏 New chat，在确认弹窗中丢弃当前对话，等页面清空并显示临时对话标识，临时对话中打开的新对话仍是临时对话
@@ -419,6 +510,7 @@ func (worker *Worker) newChat(ctx context.Context, tab *chatTab) error {
 	}
 	worker.mu.Lock()
 	tab.contents = nil
+	tab.unsent = false
 	worker.mu.Unlock()
 	return nil
 }

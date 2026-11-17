@@ -270,10 +270,10 @@ func interactionThinkingLevel(config GenerationConfig, defaults GenerationDefaul
 		level = 1
 	case "medium":
 		level = 2
-	case "high":
+	case "high", "xhigh", "extra_high", "max":
 		level = 3
 	default:
-		return 0, fmt.Errorf("reasoning effort 必须是 none、minimal、low、medium、high、xhigh 或 max")
+		return 0, fmt.Errorf("reasoning effort 必须是 none、minimal、low、medium、high、xhigh、extra_high 或 max")
 	}
 	if !defaults.ThinkingLevel {
 		return 0, nil
@@ -292,7 +292,7 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 	if request.Unary {
 		reason = "该模型使用 CreateInteractionStream，收集完成后返回"
 	}
-	reportUpstreamMode(ctx, "CreateInteractionStream", "stream", reason)
+	reportUpstreamMode(ctx, "CreateInteractionStream", "stream", 0, reason)
 	body, binding, err := EncodeCreateInteractionStreamRequest(request, entry.defaults)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
@@ -880,7 +880,7 @@ func (c *Client) generateInteractionTask(ctx context.Context, request GenerateRe
 	if request.Unary {
 		reason = "该模型使用 CreateInteraction 后台任务，收集完成后返回"
 	}
-	reportUpstreamMode(ctx, "GetInteractionStream", "stream", reason)
+	reportUpstreamMode(ctx, "GetInteractionStream", "stream", 0, reason)
 	body, binding, err := EncodeCreateInteractionRequest(request, entry.model)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)

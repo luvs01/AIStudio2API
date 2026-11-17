@@ -821,6 +821,7 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 	return aistudio.GenerateRequest{
 		ID: id, Model: model, System: system, Contents: contents, Config: config, Tools: tools,
 		SafetySettings: safety, ServiceTier: request.ServiceTier, Store: request.Store, Labels: request.Labels,
+		KeepAbnormalFinish: true,
 	}, nil
 }
 
@@ -1048,7 +1049,7 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 			}
 			mimeType, data := normalizeImagePayload(attachmentMIME(mime, inline.DisplayName, data), data)
 			parts = append(parts, aistudio.Part{
-				InlineData:       &aistudio.Blob{MIME: mimeType, Data: data},
+				InlineData:       aistudio.NewBlob(mimeType, data),
 				ThoughtSignature: part.ThoughtSignature,
 				VideoMetadata:    video, MediaProcessing: processing, DisplayName: inline.DisplayName, MediaResolution: resolution,
 			})
@@ -1089,9 +1090,6 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 				ThoughtSignature: part.ThoughtSignature,
 			})
 		case part.FunctionResponse != nil:
-			if part.FunctionResponse.Name == "" {
-				return nil, false, fmt.Errorf("functionResponse requires name")
-			}
 			response, err := geminiJSONObject(part.FunctionResponse.Response, "functionResponse.response")
 			if err != nil {
 				return nil, false, err
@@ -1133,8 +1131,7 @@ func geminiJSONObject(raw json.RawMessage, field string) (json.RawMessage, error
 	if len(raw) == 0 {
 		return json.RawMessage(`{}`), nil
 	}
-	var object map[string]any
-	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+	if value := bytes.TrimSpace(raw); len(value) == 0 || value[0] != '{' {
 		return nil, fmt.Errorf("%s must be an object", field)
 	}
 	return raw, nil
@@ -1379,7 +1376,7 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 	writeJSON(w, http.StatusOK, officialOrder("gemini", buildGeminiResponse(request, output.cache, results)))
 }
 
-// writeGeminiFailure 写出响应头之前的生成失败，上游拒绝输入时按 Gemini API 返回 200 与 promptFeedback
+// writeGeminiFailure 写出响应头之前的生成失败，上游按输入拦截时按 Gemini API 返回 200 与 promptFeedback
 func writeGeminiFailure(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, err error, stream bool) {
 	if !shouldWriteRequestError(r, err) {
 		return
@@ -1398,24 +1395,24 @@ func writeGeminiFailure(w http.ResponseWriter, r *http.Request, request aistudio
 	}
 }
 
-// geminiPromptFeedback 把上游输入拒绝投影为不含候选的 Gemini 响应
+// geminiPromptFeedback 把上游输入拦截投影为不含候选的 Gemini 响应，用量为拦截帧中上游计入的输入
 func geminiPromptFeedback(request aistudio.GenerateRequest, err error) (map[string]any, bool) {
 	var feedback *aistudio.PromptFeedbackError
 	if !errors.As(err, &feedback) {
 		return nil, false
 	}
-	reason := strings.ToUpper(strings.TrimSpace(feedback.Reason))
-	if reason == "" || reason == "UNSPECIFIED" {
-		reason = "BLOCK_REASON_UNSPECIFIED"
-	}
-	block := map[string]any{"blockReason": reason}
+	block := map[string]any{"blockReason": strings.ToUpper(feedback.Reason)}
 	if feedback.Message != "" {
 		block["blockReasonMessage"] = feedback.Message
 	}
 	if len(feedback.SafetyRatings) > 0 {
 		block["safetyRatings"] = feedback.SafetyRatings
 	}
-	return map[string]any{"promptFeedback": block, "modelVersion": request.Model, "responseId": request.ID}, true
+	response := map[string]any{"promptFeedback": block, "modelVersion": request.Model, "responseId": request.ID}
+	if feedback.Usage != nil {
+		response["usageMetadata"] = geminiUsage(feedback.Usage)
+	}
+	return response, true
 }
 
 // buildGeminiResponse 按候选序号输出各候选内容与终止原因，用量为全部候选之和，cache 非空时计入缓存部分
@@ -1781,7 +1778,7 @@ func geminiUsage(usage *aistudio.Usage) map[string]any {
 	return metadata
 }
 
-// geminiStream 写出 streamGenerateContent 的响应块：alt=sse 时为静默时写出空行心跳的 SSE，否则与官方 REST 一样为逐个对象写出的 JSON 数组
+// geminiStream 写出 streamGenerateContent 的响应块：alt=sse 时为静默时写出空帧心跳的 SSE，否则与官方 REST 一样为逐个对象写出的 JSON 数组
 type geminiStream struct {
 	w         http.ResponseWriter
 	keepalive *streamKeepalive
@@ -1804,14 +1801,27 @@ func openGeminiStream(w http.ResponseWriter, r *http.Request) (*geminiStream, er
 
 // write 写出一个响应块
 func (stream *geminiStream) write(value map[string]any) error {
-	stream.mu.Lock()
-	defer stream.mu.Unlock()
-	if stream.keepalive != nil {
-		return writeSSE(stream.w, "", officialOrder("gemini", value))
-	}
 	data, err := json.Marshal(officialOrder("gemini", value))
 	if err != nil {
 		return err
+	}
+	return stream.writeJSON(data)
+}
+
+// geminiTextChunk 返回只含一段正文的流式响应块，字节与按官方字段顺序编码的同一对象相同
+func geminiTextChunk(index int, text, model, responseID string) []byte {
+	chunk := appendJSONString(append(make([]byte, 0, 128+len(text)), `{"candidates":[{"content":{"parts":[{"text":`...), text)
+	chunk = strconv.AppendInt(append(chunk, `}],"role":"model"},"index":`...), int64(index), 10)
+	chunk = appendJSONString(append(chunk, `}],"modelVersion":`...), model)
+	return append(appendJSONString(append(chunk, `,"responseId":`...), responseID), '}')
+}
+
+// writeJSON 写出一个已编码的响应块
+func (stream *geminiStream) writeJSON(data []byte) error {
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if stream.keepalive != nil {
+		return writeSSEFrame(stream.w, append(append(sseFrameStart("", len(data)), data...), "\n\n"...))
 	}
 	prefix := "["
 	if stream.written {
@@ -1819,6 +1829,23 @@ func (stream *geminiStream) write(value map[string]any) error {
 	}
 	stream.written = true
 	if _, err := io.WriteString(stream.w, prefix+string(data)); err != nil {
+		return err
+	}
+	return http.NewResponseController(stream.w).Flush()
+}
+
+// fail 写出流内错误：SSE 按官方 SDK 的解析方式写成不带 data: 前缀的整块 JSON，JSON 数组中写为一个元素
+func (stream *geminiStream) fail(value map[string]any) error {
+	if stream.keepalive == nil {
+		return stream.write(value)
+	}
+	data, err := json.Marshal(officialOrder("gemini", value))
+	if err != nil {
+		return err
+	}
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	if _, err := stream.w.Write(append(data, '\n')); err != nil {
 		return err
 	}
 	return http.NewResponseController(stream.w).Flush()
@@ -1861,6 +1888,9 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 			if event.FinishFrame {
 				finalParts[index] = append(finalParts[index], part)
 				return nil
+			}
+			if text, ok := part["text"].(string); ok && len(part) == 1 && event.TurnToken == "" && event.FrameUsage == nil {
+				return stream.writeJSON(geminiTextChunk(index, text, cmp.Or(event.ProviderModel, request.Model), cmp.Or(event.ResponseID, request.ID)))
 			}
 			candidate := map[string]any{"index": index, "content": map[string]any{"role": "model", "parts": []any{part}}}
 			frame := map[string]any{"responseId": cmp.Or(event.ResponseID, request.ID), "modelVersion": cmp.Or(event.ProviderModel, request.Model), "candidates": []any{candidate}}
@@ -1908,9 +1938,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 			_ = write(response)
 			return
 		}
-		_ = write(map[string]any{"error": map[string]any{
-			"code": statusFromError(err), "message": err.Error(), "status": geminiErrorStatus(err),
-		}})
+		_ = stream.fail(map[string]any{"error": geminiErrorPayload(err, retryAfterSeconds(err))})
 		return
 	}
 	candidates.record(r.Context(), results)

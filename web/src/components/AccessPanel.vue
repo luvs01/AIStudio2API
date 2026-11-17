@@ -588,15 +588,17 @@ function methodClass(method: string): string {
           </template>
 
           <template v-else-if="section === 'clients'">
-            <div class="space-y-1.5">
+            <div class="grid gap-x-3 gap-y-1.5 @lg:grid-cols-[max-content_minmax(0,1fr)]">
               <div
                 v-for="group in clientGroups"
                 :key="group.label"
-                class="grid gap-x-3 gap-y-1 @lg:grid-cols-[5.5rem_minmax(0,1fr)]"
+                class="grid gap-y-1 @lg:col-span-2 @lg:grid-cols-subgrid"
                 role="group"
                 :aria-label="group.label"
               >
-                <div class="text-xs leading-8 text-gray-500">{{ group.label }}</div>
+                <div class="text-xs leading-8 whitespace-nowrap text-gray-500">
+                  {{ group.label }}
+                </div>
                 <div class="flex flex-wrap gap-1">
                   <button
                     v-for="item in group.items"
@@ -809,6 +811,14 @@ function methodClass(method: string): string {
               <div class="border-b border-line p-4">
                 <h4 class="text-base font-semibold text-white">{{ t(capability.label) }}</h4>
                 <p class="mt-1 text-sm text-gray-400">{{ t(capability.description) }}</p>
+                <p
+                  v-if="capability.notice"
+                  class="mt-2 flex items-start gap-2 text-sm text-amber-200"
+                >
+                  <UiIcon name="warning" :size="15" class="mt-0.5 shrink-0" />{{
+                    t(capability.notice)
+                  }}
+                </p>
                 <ul class="mt-3 flex flex-wrap gap-1.5">
                   <li v-for="[method, path] in capability.endpoints" :key="method + path">
                     <button

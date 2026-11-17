@@ -14,6 +14,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
+	"github.com/Mag1cFall/AIStudio2API/internal/waa/prooftime"
 )
 
 // accountWorkerManager 管理每账户的长驻 WAA worker
@@ -115,20 +116,43 @@ func (preparer *accountWorkerPreparer) Prepare(ctx context.Context, request aist
 		return aistudio.PreparedProtectedRequest{}, errAccountWorkerReplaced
 	}
 	startedAt := time.Now()
-	defer func() { api.AddAccessLogProof(ctx, time.Since(startedAt)) }()
-	prepared, err := preparer.worker.Prepare(ctx, request)
+	timing := &prooftime.Timing{}
+	defer func() {
+		proof := accessLogProof(timing)
+		proof.Total = time.Since(startedAt)
+		api.AddAccessLogProof(ctx, proof)
+	}()
+	prepared, err := preparer.worker.Prepare(prooftime.With(ctx, timing), request)
+	if lease, ok := aistudio.AccountLeaseFromContext(ctx); ok && prepared.Proof != "" {
+		lease.ProofDone()
+	}
 	if err != nil && !preparer.current() {
 		return aistudio.PreparedProtectedRequest{}, errAccountWorkerReplaced
 	}
 	return prepared, err
 }
 
-// SendProtected 校验当前账户 Worker 后发送浏览器请求
+// SendProtected 校验当前账户 Worker 后发送浏览器请求，界面运行时页面取 proof 的分项计入请求的 WAA 耗时
 func (preparer *accountWorkerPreparer) SendProtected(ctx context.Context, request aistudio.ProtectedRequest) (*aistudio.RPCResponse, error) {
 	if !preparer.current() {
 		return nil, errAccountWorkerReplaced
 	}
-	return preparer.worker.SendProtected(ctx, request)
+	if lease, ok := aistudio.AccountLeaseFromContext(ctx); ok {
+		defer lease.ProofDone()
+	}
+	timing := &prooftime.Timing{}
+	defer func() { api.AddAccessLogProof(ctx, accessLogProof(timing)) }()
+	return preparer.worker.SendProtected(prooftime.With(ctx, timing), request)
+}
+
+// accessLogProof 返回 timing 累计的各分项，Total 为分项之和
+func accessLogProof(timing *prooftime.Timing) api.ProofTiming {
+	proof := api.ProofTiming{
+		Lock: timing.Duration(prooftime.Lock), Interaction: timing.Duration(prooftime.Interaction),
+		Refresh: timing.Duration(prooftime.Refresh), Compute: timing.Duration(prooftime.Compute), SettingsSkipped: timing.Skipped(),
+	}
+	proof.Total = proof.Lock + proof.Interaction + proof.Refresh + proof.Compute
+	return proof
 }
 
 // BrowserStorageState 返回同一有效账户 Worker 的浏览器 Cookie 状态
@@ -234,7 +258,7 @@ func (manager *accountWorkerManager) expandInBackground(accountID string, modelI
 			errors.Is(err, errAccountWorkerCapacity) || errors.Is(err, errAccountRuntimeBusy) {
 			return
 		}
-		manager.requests.log(accountID, "WARN", fmt.Sprintf("WAA Worker 后台扩容失败 | 错误=%v", err))
+		manager.requests.log(accountID, "WARN", "WAA Worker 后台扩容失败", "error", err)
 		var startup *accountWorkerInitError
 		if manager.proxyFailed != nil && errors.As(err, &startup) && proxyNetworkError(ctx, err) {
 			manager.proxyFailed(startup.proxy, accountID, err)
@@ -273,9 +297,7 @@ func (manager *accountWorkerManager) markRuntimeBusy(account *accountWorker, cau
 	label := account.label
 	account.mu.Unlock()
 	if first {
-		manager.requests.log(label, "WARN", fmt.Sprintf(
-			"WAA Worker 账户由其他进程占用 | 暂停调度=%s | 错误=%s", delay, strings.TrimSpace(cause.Error()),
-		))
+		manager.requests.log(label, "WARN", "WAA Worker 账户由其他进程占用", "paused", delay, "error", cause)
 	}
 	time.AfterFunc(delay, manager.notifyScheduling)
 	return busyErr
@@ -366,13 +388,11 @@ func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
 	evicted, err := manager.evictIdleWorker(manager.lifecycle, victim)
 	manager.releaseVictim(victim)
 	if err != nil {
-		manager.requests.log(victim, "WARN", fmt.Sprintf("WAA Worker 空闲回收失败 | 错误=%v", err))
+		manager.requests.log(victim, "WARN", "WAA Worker 空闲回收失败", "error", err)
 		return false
 	}
 	if evicted {
-		manager.requests.log("service", "INFO", fmt.Sprintf(
-			"WAA Worker 空闲回收 | Worker=%d/%d", len(manager.WarmAccountIDs()), manager.activeLimit(),
-		))
+		manager.requests.log("service", "INFO", "WAA Worker 空闲回收", "workers", fmt.Sprintf("%d/%d", len(manager.WarmAccountIDs()), manager.activeLimit()))
 	}
 	return evicted
 }
@@ -454,18 +474,12 @@ func (manager *accountWorkerManager) stopAccountWorker(account *accountWorker) e
 	} else if account.cleanupWorker != nil {
 		pid = account.cleanupWorker.State().PID
 	}
-	manager.requests.log(account.label, "INFO", fmt.Sprintf("WAA Worker 停止 | PID=%d", pid))
+	manager.requests.log(account.label, "INFO", "WAA Worker 停止", "pid", pid)
 	if err := manager.closeAccountWorker(account); err != nil {
-		manager.requests.log(account.label, "ERROR", fmt.Sprintf(
-			"WAA Worker 停止失败 | PID=%d | 耗时=%s | 错误=%s",
-			pid, time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
-		))
+		manager.requests.log(account.label, "ERROR", "WAA Worker 停止失败", "pid", pid, "duration", time.Since(startedAt), "error", err)
 		return err
 	}
-	manager.requests.log(account.label, "INFO", fmt.Sprintf(
-		"WAA Worker 已停止 | PID=%d | 耗时=%s",
-		pid, time.Since(startedAt).Round(time.Millisecond),
-	))
+	manager.requests.log(account.label, "INFO", "WAA Worker 已停止", "pid", pid, "duration", time.Since(startedAt))
 	return nil
 }
 
@@ -516,6 +530,9 @@ func (manager *accountWorkerManager) ResetIfGeneration(ctx context.Context, acco
 	defer account.mu.Unlock()
 	if account.generation.Load() != generation {
 		return nil
+	}
+	if account.worker != nil {
+		account.worker.Retire()
 	}
 	return manager.stopAccountWorker(account)
 }
@@ -741,7 +758,7 @@ func (manager *accountWorkerManager) PrewarmTarget() int {
 			available++
 		}
 	}
-	return min(manager.warmLimit(), available)
+	return min(int(manager.warmTarget.Load()), available)
 }
 
 func (manager *accountWorkerManager) classifyBootstrapCandidates(
@@ -932,15 +949,13 @@ func (manager *accountWorkerManager) reloadWorker(ctx context.Context, accountID
 	err := worker.Reload(reloadCtx)
 	cancel()
 	if err != nil {
-		manager.requests.log(label, "WARN", fmt.Sprintf(
-			"WAA Worker 重新载入页面失败 | 耗时=%s | 错误=%s", time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
-		))
+		manager.requests.log(label, "WARN", "WAA Worker 重新载入页面失败", "duration", time.Since(startedAt), "error", err)
 		return err
 	}
 	if err := manager.rememberPageHeaders(accountID, worker); err != nil {
 		return err
 	}
-	manager.requests.log(label, "INFO", fmt.Sprintf("WAA Worker 页面已重新载入 | 耗时=%s", time.Since(startedAt).Round(time.Millisecond)))
+	manager.requests.log(label, "INFO", "WAA Worker 页面已重新载入", "duration", time.Since(startedAt))
 	return nil
 }
 
@@ -961,9 +976,8 @@ func (manager *accountWorkerManager) loadTemporaryPage(ctx context.Context, acco
 	if err := closePendingWorker(preparer); err != nil {
 		return camoufoxnative.PageCatalog{}, err
 	}
-	manager.requests.log(preparer.account.label, "INFO", fmt.Sprintf(
-		"WAA Worker 临时页面已关闭 | 页面模型=%s | 耗时=%s", bootstrapModel, time.Since(preparer.startedAt).Round(time.Millisecond),
-	))
+	manager.requests.logStage(preparer.account.label, "INFO", api.LogStage{Name: "WAA Worker 启动", State: "completed"}, "WAA Worker 临时页面已关闭",
+		"page_model", bootstrapModel, "duration", time.Since(preparer.startedAt))
 	return catalog, nil
 }
 
@@ -1091,10 +1105,7 @@ func (manager *accountWorkerManager) startReservedWorker(
 		}
 		if err != nil {
 			account.startupMu.Unlock()
-			manager.requests.log(label, "ERROR", fmt.Sprintf(
-				"WAA Worker 启动失败 | 耗时=%s | 错误=%s",
-				time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
-			))
+			manager.requests.logStage(label, "ERROR", api.LogStage{Name: "WAA Worker 启动", State: "failed"}, "WAA Worker 启动失败", "duration", time.Since(startedAt), "error", err)
 			return nil, &accountWorkerInitError{err: err}
 		}
 		ownsLease = true
@@ -1116,22 +1127,18 @@ func (manager *accountWorkerManager) startReservedWorker(
 		return nil, err
 	}
 	reload, _ := ctx.Value(workerReloadKey{}).(bool)
-	logStep := func(step int, message string) {
+	logStep := func(step int, message string, attrs ...any) {
 		if reload {
-			manager.requests.log(label, "INFO", "WAA Worker 启动 | 重新载入 | "+message)
+			manager.requests.logStage(label, "INFO", api.LogStage{Name: "WAA Worker 启动"}, fmt.Sprintf("重新载入：%s", message), attrs...)
 			return
 		}
-		manager.requests.log(label, "INFO", fmt.Sprintf("WAA Worker 启动 | %d/7 | %s", step, message))
+		manager.requests.logStage(label, "INFO", api.LogStage{Name: "WAA Worker 启动", Step: step, Steps: 7}, message, attrs...)
 	}
-	logStep(1, "初始化页面 | 页面模型="+bootstrapModel)
+	logStep(1, "初始化页面", "page_model", bootstrapModel)
 	initCtx, cancel := context.WithTimeout(ctx, manager.initTimeout)
 	options.Model = bootstrapModel
-	launched, _ := ctx.Value(browserLaunchedKey{}).(func())
 	options.StartupProgress = func(stage camoufoxnative.StartupStage) {
 		logStep(workerStartupProgress(stage))
-		if (stage == camoufoxnative.StartupConnectingBiDi || stage == camoufoxnative.StartupLoadingAIStudio) && launched != nil {
-			launched()
-		}
 	}
 	worker, initErr := newWAAWorker(initCtx, account.id, options)
 	if initErr == nil {
@@ -1147,20 +1154,16 @@ func (manager *accountWorkerManager) startReservedWorker(
 		}
 		account.startupMu.Unlock()
 		if err := ctx.Err(); err != nil {
-			manager.requests.log(label, "WARN", fmt.Sprintf(
-				"WAA Worker 启动已取消 | 页面模型=%s | 耗时=%s",
-				bootstrapModel, time.Since(startedAt).Round(time.Millisecond),
-			))
+			manager.requests.logStage(label, "WARN", api.LogStage{Name: "WAA Worker 启动", State: "cancelled"}, "WAA Worker 启动已取消",
+				"page_model", bootstrapModel, "duration", time.Since(startedAt))
 			return nil, err
 		}
 		if manager.refresher != nil && !reload && aistudio.DefinitiveAuthenticationFailure(initErr) {
-			manager.requests.log(label, "INFO", "WAA Worker 启动 | 登录态失效，账户认证续签 | 错误="+strings.TrimSpace(initErr.Error()))
+			manager.requests.logStage(label, "INFO", api.LogStage{Name: "WAA Worker 启动"}, "登录态失效，账户认证续签", "error", initErr)
 			return nil, &accountWorkerInitError{err: initErr, proxy: options.Proxy}
 		}
-		manager.requests.log(label, "ERROR", fmt.Sprintf(
-			"WAA Worker 启动失败 | 页面模型=%s | 耗时=%s | 错误=%s",
-			bootstrapModel, time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(initErr.Error()),
-		))
+		manager.requests.logStage(label, "ERROR", api.LogStage{Name: "WAA Worker 启动", State: "failed"}, "WAA Worker 启动失败",
+			"page_model", bootstrapModel, "duration", time.Since(startedAt), "error", initErr)
 		return nil, &accountWorkerInitError{err: initErr, proxy: options.Proxy}
 	}
 	return &accountWorkerPreparer{
@@ -1190,9 +1193,7 @@ func activateAccountWorker(preparer *accountWorkerPreparer) error {
 			label := preparer.account.label
 			preparer.account.mu.Unlock()
 			cleanupErr := discardAccountWorker(preparer)
-			preparer.manager.requests.log(label, "ERROR", fmt.Sprintf(
-				"WAA Worker 旧实例停止失败 | 错误=%s", strings.TrimSpace(closeErr.Error()),
-			))
+			preparer.manager.requests.log(label, "ERROR", "WAA Worker 旧实例停止失败", "error", closeErr)
 			return errors.Join(closeErr, cleanupErr)
 		}
 	}
@@ -1209,10 +1210,8 @@ func activateAccountWorker(preparer *accountWorkerPreparer) error {
 	label := preparer.account.label
 	preparer.account.mu.Unlock()
 	preparer.manager.notifyScheduling()
-	preparer.manager.requests.log(label, "INFO", fmt.Sprintf(
-		"WAA Worker 就绪 | 页面模型=%s | PID=%d | 耗时=%s",
-		preparer.bootstrapModel, preparer.worker.State().PID, time.Since(preparer.startedAt).Round(time.Millisecond),
-	))
+	preparer.manager.requests.logStage(label, "INFO", api.LogStage{Name: "WAA Worker 启动", State: "completed"}, "WAA Worker 就绪",
+		"page_model", preparer.bootstrapModel, "pid", preparer.worker.State().PID, "duration", time.Since(preparer.startedAt))
 	preparer.pending = false
 	preparer.account.startupMu.Unlock()
 	return nil
@@ -1227,10 +1226,8 @@ func discardAccountWorker(preparer *accountWorkerPreparer) error {
 	preparer.account.mu.Lock()
 	label := preparer.account.label
 	preparer.account.mu.Unlock()
-	preparer.manager.requests.log(label, "WARN", fmt.Sprintf(
-		"WAA Worker 启动已取消 | 页面模型=%s | 耗时=%s",
-		preparer.bootstrapModel, time.Since(preparer.startedAt).Round(time.Millisecond),
-	))
+	preparer.manager.requests.logStage(label, "WARN", api.LogStage{Name: "WAA Worker 启动", State: "cancelled"}, "WAA Worker 启动已取消",
+		"page_model", preparer.bootstrapModel, "duration", time.Since(preparer.startedAt))
 	return cleanupErr
 }
 
@@ -1506,9 +1503,9 @@ func (manager *accountWorkerManager) openWorker(
 	switch {
 	case warmCount <= manager.warmLimit():
 	case replacing:
-		manager.requests.log("service", "INFO", fmt.Sprintf("WAA Worker 按需替换 | Worker=%d/%d", warmCount, manager.activeLimit()))
+		manager.requests.log("service", "INFO", "WAA Worker 按需替换", "workers", fmt.Sprintf("%d/%d", warmCount, manager.activeLimit()))
 	default:
-		manager.requests.log("service", "INFO", fmt.Sprintf("WAA Worker 按需扩容 | Worker=%d/%d", warmCount, manager.activeLimit()))
+		manager.requests.log("service", "INFO", "WAA Worker 按需扩容", "workers", fmt.Sprintf("%d/%d", warmCount, manager.activeLimit()))
 	}
 	return preparer, nil
 }
@@ -1564,7 +1561,7 @@ func (manager *accountWorkerManager) detachStartup(
 			stop()
 			cancel()
 			if err := release(); err != nil {
-				manager.requests.log(lease.Account().Config.Label, "WARN", "账户租约释放失败 | 错误="+err.Error())
+				manager.requests.log(lease.Account().Config.Label, "WARN", "账户租约释放失败", "error", err)
 			}
 		}()
 		preparer, err := start(startupCtx)
@@ -1609,6 +1606,9 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 	if started {
 		worker, err = manager.startReservedWorker(ctx, accountID, model)
 	}
+	if denial := aistudio.RestrictionDenial(err); denial != nil {
+		return nil, errors.Join(err, manager.pool.MarkRestricted(accountID, denial))
+	}
 	if !aistudio.DefinitiveAuthenticationFailure(err) {
 		return worker, err
 	}
@@ -1619,10 +1619,13 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 			if err == nil {
 				return worker, nil
 			}
+			if denial := aistudio.RestrictionDenial(err); denial != nil {
+				return nil, errors.Join(err, manager.pool.MarkRestricted(accountID, denial))
+			}
 			err = manager.refresher.markAuthenticationRequired(ctx, err)
 		} else {
 			err = recoverErr
-			manager.requests.log(lease.Account().Config.Label, "ERROR", "WAA Worker 启动失败 | 错误="+strings.TrimSpace(err.Error()))
+			manager.requests.logStage(lease.Account().Config.Label, "ERROR", api.LogStage{Name: "WAA Worker 启动", State: "failed"}, "WAA Worker 启动失败", "error", err)
 		}
 	} else if ctx.Err() == nil {
 		err = errors.Join(err, lease.ConfirmAuthenticationFailure(ctx, err))
@@ -1680,10 +1683,7 @@ type temporaryPageKey struct{}
 // startupReservationKey 是 context 中常驻或按需启动的启动名额预约的键，启动取得名额后结束预约
 type startupReservationKey struct{}
 
-// browserLaunchedKey 是 context 中 Worker 的浏览器进程完成启动、开始连接 WebDriver BiDi 或载入 AI Studio 时调用的函数的键
-type browserLaunchedKey struct{}
-
-// fillWarm 按启动名额补足常驻 Worker，候选账户的目录就绪后立即启动，不等待已在启动的 Worker
+// fillWarm 逐个补足常驻 Worker：候选账户的目录就绪后启动，上一个 Worker 启动结束后再启动下一个
 func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- error, cleanup func()) {
 	startedAt := time.Now()
 	defer cleanup()
@@ -1701,8 +1701,6 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 	failedAccounts := make(map[string]struct{})
 	starting := make(map[string]struct{})
 	launched := 0
-	head := ""
-	var headLaunched chan struct{}
 	results := make(chan warmResult)
 	collect := func(result warmResult) {
 		delete(starting, result.accountID)
@@ -1730,29 +1728,14 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		limit := manager.warmLimit()
 		if len(warm) >= limit {
 			if launched > 0 {
-				manager.requests.log("service", "INFO", fmt.Sprintf(
-					"WAA Worker 预热完成 | Worker=%d/%d | 耗时=%s",
-					len(warm), manager.PrewarmTarget(), time.Since(startedAt).Round(time.Millisecond),
-				))
+				manager.requests.log("service", "INFO", "WAA Worker 预热完成",
+					"workers", fmt.Sprintf("%d/%d", len(warm), manager.PrewarmTarget()), "duration", time.Since(startedAt))
 			}
 			notify(nil)
 			return
 		}
 		opening := manager.openingOutside(starting)
-		launch := min(manager.startup.size(), limit-len(warm)-opening) - len(starting)
-		if head != "" {
-			select {
-			case <-headLaunched:
-				head, headLaunched = "", nil
-			default:
-				if _, ok := starting[head]; !ok {
-					head, headLaunched = "", nil
-				}
-			}
-		}
-		if head != "" {
-			launch = 0
-		}
+		launch := min(1, limit-len(warm)-opening) - len(starting)
 		groups, err := manager.classifyBootstrapCandidates(ctx, warm)
 		var runtimeBusyErr error
 		if err != nil {
@@ -1770,17 +1753,11 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		pendingBusy := err == nil && len(groups.StandbyBusy) > 0
 		if err == nil {
 			ready := groups.StandbyReady[:max(0, min(launch, len(groups.StandbyReady)))]
-			workerCtx := ctx
-			if len(ready) > 0 && launched == 0 && len(warm) == 0 {
-				ready = ready[:1]
-				head, headLaunched = ready[0], make(chan struct{})
-				workerCtx = context.WithValue(ctx, browserLaunchedKey{}, sync.OnceFunc(func() { close(headLaunched) }))
-			}
 			for _, accountID := range ready {
 				starting[accountID] = struct{}{}
 				launched++
 				go func() {
-					_, err := manager.Worker(workerCtx, accountID, "")
+					_, err := manager.Worker(ctx, accountID, "")
 					results <- warmResult{accountID: accountID, err: err}
 				}()
 			}
@@ -1791,7 +1768,6 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 			case <-ctx.Done():
 			case result := <-results:
 				collect(result)
-			case <-headLaunched:
 			case <-timer.C:
 			}
 			timer.Stop()
@@ -1815,19 +1791,15 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		warm = manager.WarmAccountIDs()
 		if len(warm) > 0 {
 			if launched > 0 {
-				manager.requests.log("service", "INFO", fmt.Sprintf(
-					"WAA Worker 预热完成 | Worker=%d/%d | 失败=%d | 耗时=%s",
-					len(warm), manager.PrewarmTarget(), len(failedAccounts), time.Since(startedAt).Round(time.Millisecond),
-				))
+				manager.requests.log("service", "INFO", "WAA Worker 预热完成",
+					"workers", fmt.Sprintf("%d/%d", len(warm), manager.PrewarmTarget()), "failed", len(failedAccounts), "duration", time.Since(startedAt))
 			}
 			notify(nil)
 			return
 		}
 		if err == nil && runtimeBusyErr == nil && !groups.EarliestCooldown.Until.IsZero() {
 			if !notified {
-				manager.requests.log("service", "INFO", fmt.Sprintf(
-					"WAA Worker 预热等待账户冷却 | 恢复=%s", groups.EarliestCooldown.Until.Local().Format(time.RFC3339),
-				))
+				manager.requests.log("service", "INFO", "WAA Worker 预热等待账户冷却", "until", groups.EarliestCooldown.Until.Local().Format(time.RFC3339))
 			}
 			notify(nil)
 			if err := waitScheduling(ctx, nil, min(time.Until(groups.EarliestCooldown.Until), schedulingRecheck)); err != nil {

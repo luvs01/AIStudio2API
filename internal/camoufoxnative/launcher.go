@@ -86,6 +86,8 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		_ = removeProfile(profile, profileLock)
 		return nil, "", err
 	}
+	// intl.locale.requested 选用 Camoufox 内置语言包，界面语言与 Intl 默认区域随指纹语言
+	prefs["intl.locale.requested"] = requestedLocale(config)
 	if options.Headless && !options.liveView {
 		prefs["layout.frame_rate"] = interactiveFrameRate
 		// gfx.webrender.enable-subpixel-aa 为 false 时 WebRender 把字形光栅化到单通道图集，不分配 RGBA 字形图集
@@ -114,6 +116,8 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		}
 		// gfx.font_loader.delay 为 0 时 Firefox 同步加载本地化与带字重的字体族名
 		prefs["gfx.font_loader.delay"] = 0
+		// ui.key.accelKey 为 17 时快捷键修饰键与 Windows 指纹一致为 Control
+		prefs["ui.key.accelKey"] = 17
 		if !options.Headless {
 			// layers.gpu-process.enabled 为 false 时由注册了随包字体的主进程绘制窗口，webgl.allow-in-parent 让 WebGL 随之在主进程运行
 			prefs["layers.gpu-process.enabled"] = false
@@ -396,13 +400,13 @@ const windowsAudioChannels = 2
 const windowsAudioSampleRate = 48000
 
 // windowsChromeHeight 为 Windows 版 Camoufox 窗口中浏览器界面占用的高度
-const windowsChromeHeight = 57
+const windowsChromeHeight = 85
 
 // windowsStorageLimit 为使站点存储配额取 Firefox 上限 10 GiB 的全局存储上限，单位 KB
 const windowsStorageLimit = 50 << 20
 
 // hostChromeHeight 为 macOS 与 Linux 版 Camoufox 窗口中浏览器界面占用的高度
-const hostChromeHeight = 51
+var hostChromeHeight = map[string]int{"darwin": 85, "linux": 86}[runtime.GOOS]
 
 // windowsWindowPosition 为 Windows 版按 browser.xhtml 的 screenX、screenY 放置主窗口的坐标
 const windowsWindowPosition = 4
@@ -533,6 +537,15 @@ func browserProxy(value string) (*proxydial.Relay, string, error) {
 		return nil, "", err
 	}
 	return relay, "socks5://" + relay.Addr().String(), nil
+}
+
+// requestedLocale 返回指纹 locale:language 与 locale:region 组成的界面语言
+func requestedLocale(config map[string]any) string {
+	language, _ := config["locale:language"].(string)
+	if region, _ := config["locale:region"].(string); region != "" {
+		return language + "-" + region
+	}
+	return language
 }
 
 func firefoxPreferences(proxyValue, bypass string) (map[string]any, error) {

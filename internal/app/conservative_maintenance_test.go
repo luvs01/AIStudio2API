@@ -16,7 +16,6 @@ type conservativeMaintenanceCatalog struct {
 	models    []aistudio.Model
 	refreshed int
 	expired   int
-	idle      int
 	patrolled int
 }
 
@@ -31,11 +30,6 @@ func (catalog *conservativeMaintenanceCatalog) CachedModels() []aistudio.Model {
 
 func (catalog *conservativeMaintenanceCatalog) ReclaimExpiredResources(context.Context) error {
 	catalog.expired++
-	return nil
-}
-
-func (catalog *conservativeMaintenanceCatalog) ReclaimIdleAssistantApplets(context.Context) error {
-	catalog.idle++
 	return nil
 }
 
@@ -61,8 +55,8 @@ func TestConservativeMaintenanceRecoversCatalogAndReclaims(t *testing.T) {
 			close(done)
 		}()
 		synctest.Wait()
-		if catalog.expired != 1 || catalog.idle != 1 {
-			t.Fatalf("startup cleanup: expired=%d idle=%d", catalog.expired, catalog.idle)
+		if catalog.expired != 1 {
+			t.Fatalf("startup cleanup: expired=%d", catalog.expired)
 		}
 		time.Sleep(modelCatalogRetryInterval)
 		synctest.Wait()
@@ -71,11 +65,14 @@ func TestConservativeMaintenanceRecoversCatalogAndReclaims(t *testing.T) {
 		}
 		time.Sleep(idleResourceReclaimInterval - modelCatalogRetryInterval)
 		synctest.Wait()
-		if catalog.expired != 2 || catalog.idle != 2 || catalog.refreshed != 1 {
-			t.Fatalf("periodic cleanup: expired=%d idle=%d refreshed=%d", catalog.expired, catalog.idle, catalog.refreshed)
+		if catalog.expired != 2 || catalog.refreshed != 1 {
+			t.Fatalf("periodic cleanup: expired=%d refreshed=%d", catalog.expired, catalog.refreshed)
 		}
 		time.Sleep(accountStateRefreshInterval)
 		synctest.Wait()
+		if got := service.catalogModelID(ctx, "unknown-model"); got != "unknown-model" {
+			t.Fatalf("missing model lookup = %q", got)
+		}
 		if catalog.patrolled != 0 || catalog.refreshed != 1 {
 			t.Fatalf("unsolicited account polling: patrolled=%d refreshed=%d", catalog.patrolled, catalog.refreshed)
 		}

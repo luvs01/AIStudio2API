@@ -358,8 +358,14 @@ func (p *AccountPool) AssistantModel(modelID string) bool {
 	return p.assistantModelLocked(modelID)
 }
 
+// assistantModelLocked 判断模型是否带 assistant_route 能力，调用方持有 p.mu
 func (p *AccountPool) assistantModelLocked(modelID string) bool {
 	return p.modelCapabilityLocked(modelID, "assistant_route")
+}
+
+// assistantBusyLocked 判断账户正在为 -build 选择运行另一个写代码助手生成，同一账户同时只运行一个
+func (p *AccountPool) assistantBusyLocked(account *Account, selection AccountSelection) bool {
+	return account.assistantBusy && p.assistantModelLocked(selection.ModelID)
 }
 
 // InteractionAgentModel 判断模型是否为经 CreateInteraction 后台任务生成的 agent，如 Deep Research 与 Antigravity

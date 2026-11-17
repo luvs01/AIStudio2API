@@ -103,6 +103,8 @@ type modelCatalog struct {
 	entries map[string]modelEntry
 	// source 是解析出该目录的 ListModels 响应 JSON
 	source json.RawMessage
+	// bundle 是载入该目录的官网页面的前端主程序地址
+	bundle string
 }
 
 // ParseModels 解码 ListModels 的数组协议
@@ -608,6 +610,13 @@ func (c *Client) setModelCatalog(accountID string, catalog modelCatalog) {
 	c.catalogMu.Lock()
 	c.catalogs[accountID] = catalog
 	c.catalogMu.Unlock()
+}
+
+// accountModels 返回账户当前目录中的模型
+func (c *Client) accountModels(accountID string) []Model {
+	c.catalogMu.RLock()
+	defer c.catalogMu.RUnlock()
+	return cloneModels(c.catalogs[accountID].models)
 }
 
 // modelCatalogSource 返回账户最近一次 ListModels 的响应 JSON

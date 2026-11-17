@@ -8,6 +8,7 @@ import (
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
+	"github.com/Mag1cFall/AIStudio2API/internal/egress"
 )
 
 // AdminService 定义管理端需要的权威状态能力
@@ -15,6 +16,7 @@ type AdminService interface {
 	Status(context.Context) (AdminStatus, error)
 	CatalogModels(context.Context) ([]aistudio.Model, error)
 	Accounts(context.Context) ([]AdminAccount, error)
+	AccountExits(context.Context) ([]AccountExit, error)
 	CreateAccount(context.Context, AccountCreateInput, *camoufoxnative.LiveView) (AdminAccount, error)
 	ChromeImportProfiles(context.Context) ([]ChromeImportProfile, error)
 	CookieBrowsers(ctx context.Context, proxy string) ([]CookieBrowser, error)
@@ -28,6 +30,7 @@ type AdminService interface {
 	RefreshAccount(context.Context, string) (AdminAccountRefresh, error)
 	StartService(context.Context) (AdminStatus, error)
 	StopService(context.Context) (AdminStatus, error)
+	DownloadCamoufox(context.Context) (AdminStatus, error)
 	ClearLogs(context.Context) error
 	RuntimeConfig(context.Context) (RuntimeConfig, error)
 	UpdateRuntimeConfig(context.Context, RuntimeConfig) (RuntimeConfig, error)
@@ -43,14 +46,15 @@ type AdminService interface {
 
 // AdminStatus 表示管理端运行状态
 type AdminStatus struct {
-	State          string             `json:"state"`
-	Running        bool               `json:"running"`
-	Ready          bool               `json:"ready"`
-	Version        string             `json:"version"`
-	ActiveRequests int                `json:"active_requests"`
-	Accounts       AdminAccountCounts `json:"accounts"`
-	Camoufox       AdminCamoufox      `json:"camoufox"`
-	ChromeImport   bool               `json:"chrome_import"`
+	State          string                     `json:"state"`
+	Running        bool                       `json:"running"`
+	Ready          bool                       `json:"ready"`
+	Version        string                     `json:"version"`
+	ActiveRequests int                        `json:"active_requests"`
+	Accounts       AdminAccountCounts         `json:"accounts"`
+	Camoufox       camoufoxnative.Preparation `json:"camoufox"`
+	GeoIP          egress.Preparation         `json:"geoip"`
+	ChromeImport   bool                       `json:"chrome_import"`
 }
 
 // InvalidConfigValue 表示加载时取值无效、按默认值生效的一个配置项
@@ -60,50 +64,67 @@ type InvalidConfigValue struct {
 	Reason string `json:"reason"`
 }
 
-// AdminCamoufox 表示 Camoufox 是否就绪与正在进行的下载
-type AdminCamoufox struct {
-	Ready    bool                     `json:"ready"`
-	Download *camoufoxnative.Download `json:"download,omitempty"`
-}
-
 // AdminLog 表示管理页面展示的一条运行日志
 type AdminLog struct {
 	Time    time.Time   `json:"time"`
 	Level   string      `json:"level"`
 	Source  string      `json:"source"`
 	Message string      `json:"message"`
+	Fields  []LogField  `json:"fields,omitempty"`
+	Stage   *LogStage   `json:"stage,omitempty"`
 	Event   string      `json:"event"`
 	Request *RequestLog `json:"request,omitempty"`
 }
 
-// RequestLog 保存可关联的请求状态、用量与诊断字段
-type RequestLog struct {
-	ID              string            `json:"id"`
-	State           string            `json:"state"`
-	StartedAt       time.Time         `json:"started_at,omitzero"`
-	Model           string            `json:"model,omitempty"`
-	Method          string            `json:"method,omitempty"`
-	Path            string            `json:"path,omitempty"`
-	Status          int               `json:"status,omitempty"`
-	DurationMS      float64           `json:"duration_ms,omitempty"`
-	Usage           *RequestLogUsage  `json:"usage,omitempty"`
-	ToolCalls       int               `json:"tool_calls,omitempty"`
-	FinishReason    string            `json:"finish_reason,omitempty"`
-	Error           string            `json:"error,omitempty"`
-	InputMessages   int               `json:"input_messages,omitempty"`
-	InputTextChars  int               `json:"input_text_chars,omitempty"`
-	InputMedia      int               `json:"input_media,omitempty"`
-	InputMediaBytes int64             `json:"input_media_bytes,omitempty"`
-	InputFiles      int               `json:"input_files,omitempty"`
-	Parameters      map[string]string `json:"parameters,omitempty"`
-	FirstEventMS    float64           `json:"first_event_ms,omitempty"`
-	QueueMS         float64           `json:"queue_ms,omitempty"`
-	ProofMS         float64           `json:"proof_ms,omitempty"`
-	UpstreamBytes   int64             `json:"upstream_bytes,omitempty"`
-	Channel         string            `json:"channel,omitempty"`
+// LogField 是日志按顺序排列的一个字段，Key 为英文标识
+type LogField struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
-// RequestLogUsage 区分输入、缓存命中、思考、回复与端到端输出速率
+// LogStage 是分阶段运行日志所属的阶段，Step 与 Steps 为当前步骤与总步骤数，State 为结束状态 completed、failed 或 cancelled
+type LogStage struct {
+	Name  string `json:"name"`
+	Step  int    `json:"step,omitempty"`
+	Steps int    `json:"steps,omitempty"`
+	State string `json:"state,omitempty"`
+}
+
+// RequestLog 保存可关联的请求状态、用量与诊断字段
+type RequestLog struct {
+	ID              string                 `json:"id"`
+	State           string                 `json:"state"`
+	StartedAt       time.Time              `json:"started_at,omitzero"`
+	Model           string                 `json:"model,omitempty"`
+	Method          string                 `json:"method,omitempty"`
+	Path            string                 `json:"path,omitempty"`
+	Status          int                    `json:"status,omitempty"`
+	DurationMS      float64                `json:"duration_ms,omitempty"`
+	Usage           *RequestLogUsage       `json:"usage,omitempty"`
+	ToolCalls       int                    `json:"tool_calls,omitempty"`
+	FinishReason    string                 `json:"finish_reason,omitempty"`
+	Error           string                 `json:"error,omitempty"`
+	InputMessages   int                    `json:"input_messages,omitempty"`
+	InputTextChars  int                    `json:"input_text_chars,omitempty"`
+	InputMedia      int                    `json:"input_media,omitempty"`
+	InputMediaBytes int64                  `json:"input_media_bytes,omitempty"`
+	InputFiles      int                    `json:"input_files,omitempty"`
+	Parameters      map[string]string      `json:"parameters,omitempty"`
+	FirstEventMS    float64                `json:"first_event_ms,omitempty"`
+	QueueMS         float64                `json:"queue_ms,omitempty"`
+	ProofMS         float64                `json:"proof_ms,omitempty"`
+	ProofPhases     *RequestLogProofPhases `json:"proof_phases,omitempty"`
+	UpstreamBytes   int64                  `json:"upstream_bytes,omitempty"`
+	Channel         string                 `json:"channel,omitempty"`
+}
+
+// RequestLogProofPhases 是请求日志中生成 WAA proof 的分项，SettingsSkipped 是空闲不够而没有做的运行设置步数
+type RequestLogProofPhases struct {
+	ProofPhasesMS
+	SettingsSkipped int `json:"settings_skipped,omitempty"`
+}
+
+// RequestLogUsage 区分输入、缓存命中、思考、回复与首字之后的输出速率
 type RequestLogUsage struct {
 	InputTokens            int64   `json:"input_tokens"`
 	CachedTokens           int64   `json:"cached_tokens"`
@@ -111,7 +132,7 @@ type RequestLogUsage struct {
 	ReplyTokens            int64   `json:"reply_tokens"`
 	OutputTokens           int64   `json:"output_tokens"`
 	TotalTokens            int64   `json:"total_tokens"`
-	AverageTokensPerSecond float64 `json:"average_tokens_per_second"`
+	AverageTokensPerSecond float64 `json:"average_tokens_per_second,omitempty"`
 }
 
 // AccessLog 表示一次公开 API 请求的最终访问记录
@@ -119,8 +140,10 @@ type AccessLog struct {
 	Status          int
 	Latency         time.Duration
 	FirstEvent      time.Duration
+	FirstOutput     int64
+	TrailingError   string
 	QueueWait       time.Duration
-	Proof           time.Duration
+	Proof           ProofTiming
 	UpstreamBytes   int64
 	Usage           *aistudio.Usage
 	ToolCalls       int
@@ -179,6 +202,16 @@ type AdminAccount struct {
 	ActiveRequests int `json:"active_requests"`
 }
 
+// AccountExit 表示一个账户出口代理的公网 IP 与按 IP 定位的国家、时区和语言，Proxy 为空时是直连，查询失败时 Error 为原因
+type AccountExit struct {
+	Proxy    string `json:"proxy"`
+	IP       string `json:"ip,omitempty"`
+	Country  string `json:"country,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
+	Locale   string `json:"locale,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
 // AdminProxy 表示代理池中一个代理的可用性与绑定账户数
 type AdminProxy struct {
 	Proxy     string     `json:"proxy"`
@@ -225,7 +258,8 @@ type ChromeImportProfile struct {
 	Profile     string `json:"profile"`
 	DisplayName string `json:"display_name"`
 	Email       string `json:"email"`
-	Locale      string `json:"locale"`
+	// Restricted 是该账户服务受限的原因，受限的账户不能导入
+	Restricted string `json:"restricted"`
 }
 
 // CookieBrowser 表示本机开启远程调试的浏览器与其中登录 AI Studio 的账户
@@ -234,11 +268,11 @@ type CookieBrowser struct {
 	Browser   string `json:"browser"`
 	Email     string `json:"email"`
 	AuthUser  int    `json:"auth_user"`
-	Locale    string `json:"locale"`
-	Timezone  string `json:"timezone"`
 	Imported  bool   `json:"imported"`
 	SignedOut bool   `json:"signed_out"`
 	Error     string `json:"error"`
+	// Restricted 是该账户服务受限的原因，受限的账户不能导入
+	Restricted string `json:"restricted"`
 
 	// DeviceBound 表示 Cookie 带 __Secure-1PSIDRTS，会话绑定原浏览器所在的设备，导入的副本约 2 小时内失效
 	DeviceBound bool `json:"device_bound"`
@@ -268,6 +302,7 @@ type RuntimeConfig struct {
 	YouTubeLinks              bool                 `json:"youtube_links"`
 	StripThoughtSignatures    bool                 `json:"strip_thought_signatures"`
 	SearchModelAliases        bool                 `json:"search_model_aliases"`
+	DiscoverHiddenModels      bool                 `json:"discover_hidden_models"`
 	GoogleSearch              bool                 `json:"google_search"`
 	FirstEventHedge           string               `json:"first_event_hedge"`
 	FirstEventHedgeModels     string               `json:"first_event_hedge_models"`
@@ -296,6 +331,7 @@ type RuntimeConfig struct {
 	PerAccountConcurrency     int                  `json:"per_account_concurrency"`
 	RoutingStrategy           string               `json:"routing_strategy"`
 	AccountOrder              string               `json:"account_order"`
+	MaxAccountSwitches        int                  `json:"max_account_switches"`
 	UpstreamChannels          []string             `json:"upstream_channels"`
 	ModelMapping              string               `json:"model_mapping"`
 	ModelChannels             string               `json:"model_channels"`
@@ -338,6 +374,7 @@ type AdminEvent struct {
 
 func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/accounts", s.handleAccounts)
+	mux.HandleFunc("GET /api/accounts/exits", s.handleAccountExits)
 	mux.HandleFunc("POST /api/accounts", s.handleCreateAccount)
 	mux.HandleFunc("GET /api/accounts/import/chrome", s.handleChromeImportProfiles)
 	mux.HandleFunc("POST /api/accounts/import/chrome", s.handleImportChromeAccounts)
@@ -356,6 +393,7 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", s.handleRefreshAccount)
 	mux.HandleFunc("POST /api/control/start", s.handleStartService)
 	mux.HandleFunc("POST /api/control/stop", s.handleStopService)
+	mux.HandleFunc("POST /api/camoufox/download", s.handleDownloadCamoufox)
 	mux.HandleFunc("DELETE /api/logs", s.handleClearLogs)
 	mux.HandleFunc("GET /api/config", s.handleRuntimeConfig)
 	mux.HandleFunc("PUT /api/config", s.handleUpdateRuntimeConfig)
@@ -397,6 +435,15 @@ func (s *server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string][]AdminAccount{"accounts": accounts})
+}
+
+func (s *server) handleAccountExits(w http.ResponseWriter, r *http.Request) {
+	exits, err := s.config.Admin.AccountExits(r.Context())
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string][]AccountExit{"exits": exits})
 }
 
 func (s *server) handleChromeImportProfiles(w http.ResponseWriter, r *http.Request) {
@@ -464,6 +511,16 @@ func (s *server) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleStartService(w http.ResponseWriter, r *http.Request) {
 	status, err := s.config.Admin.StartService(r.Context())
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// handleDownloadCamoufox 在后台重新开始下载 Camoufox 并返回服务状态
+func (s *server) handleDownloadCamoufox(w http.ResponseWriter, r *http.Request) {
+	status, err := s.config.Admin.DownloadCamoufox(r.Context())
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return

@@ -1,4 +1,4 @@
-import { computed, reactive, ref, shallowRef } from 'vue'
+import { computed, reactive, ref, shallowRef, watch } from 'vue'
 import { api, openAdminEvents } from '@/api'
 import { useI18n } from '@/i18n'
 import type {
@@ -24,7 +24,8 @@ const accounts = ref<Account[]>([])
 const accountTasks = ref<AccountTask[]>([])
 const models = ref<Model[]>([])
 const cooldowns = ref<Cooldown[]>([])
-const requests = ref<RequestSummary[]>([])
+// requests 是页面打开以来的请求，最近开始的在前，每次变化替换整个数组
+const requests = shallowRef<RequestSummary[]>([])
 const config = ref<ServiceConfig | null>(null)
 const update = ref<UpdateStatus | null>(null)
 const startPending = ref(false)
@@ -205,7 +206,7 @@ async function startService(): Promise<void> {
   try {
     status.value = await api.startService()
     if (launchCancellationRequested.value || status.value.state !== 'RUNNING') return
-    showNotice(t('app.start'), 'success')
+    showNotice(t('app.started'), 'success')
     await Promise.all([loadAccounts(), loadModels(), loadCooldowns()])
   } catch (error) {
     if (!launchCancellationRequested.value) showNotice(errorText(error), 'error')
@@ -215,12 +216,38 @@ async function startService(): Promise<void> {
   }
 }
 
+// retryCamoufox 在后台重新下载 Camoufox，从已下载的部分继续
+async function retryCamoufox(): Promise<void> {
+  try {
+    status.value = await api.downloadCamoufox()
+  } catch (error) {
+    showNotice(errorText(error), 'error')
+  }
+}
+
+// exitLookups 是进行中的出口查询数，查询可能开始新一轮出口 IP 库下载
+const exitLookups = ref(0)
+
+// statusTimer 在 Camoufox 或出口 IP 库下载期间、出口查询或账户任务进行中每秒刷新服务状态，服务端不在下载期间推送进度
+let statusTimer: number | undefined
+watch(
+  () =>
+    status.value?.camoufox.preparing === true ||
+    status.value?.geoip.preparing === true ||
+    exitLookups.value > 0 ||
+    accountTasks.value.some((task) => task.state === 'running'),
+  (polling) => {
+    window.clearInterval(statusTimer)
+    statusTimer = polling ? window.setInterval(() => void loadStatus(), 1000) : undefined
+  },
+)
+
 async function stopService(): Promise<void> {
   launchCancellationRequested.value = serviceState.value === 'launching'
   stopPending.value = true
   try {
     status.value = await api.stopService()
-    showNotice(t('app.stop'), 'success')
+    showNotice(t('app.stopped'), 'success')
     await Promise.all([loadAccounts(), loadModels(), loadCooldowns(), loadRequests()])
   } catch (error) {
     showNotice(errorText(error), 'error')
@@ -252,10 +279,23 @@ async function clearLogs(): Promise<void> {
   }
 }
 
-function replaceByID<T extends { id: string }>(items: T[], incoming: T): void {
+// requestHistoryLimit 是请求列表保留的请求数，超出时去掉最早结束的请求
+const requestHistoryLimit = 512
+
+// upsertRequest 返回替换同一请求或在开头加入新请求后的列表
+function upsertRequest(items: RequestSummary[], incoming: RequestSummary): RequestSummary[] {
   const index = items.findIndex((item) => item.id === incoming.id)
-  if (index === -1) items.unshift(incoming)
-  else items[index] = incoming
+  if (index !== -1) {
+    const next = items.slice()
+    next[index] = incoming
+    return next
+  }
+  const next = [incoming, ...items]
+  for (let oldest = next.length - 1; next.length > requestHistoryLimit && oldest >= 0; oldest--) {
+    if (next[oldest]!.state !== 'queued' && next[oldest]!.state !== 'running')
+      next.splice(oldest, 1)
+  }
+  return next
 }
 
 // updateAccount 用接口返回的账户替换列表中的同一账户
@@ -287,7 +327,7 @@ function handleAdminEvent(event: AdminEvent): void {
   }
   if (event.type === 'log') {
     pendingLogs.push(event.data)
-    if (logFlushTimer === undefined) logFlushTimer = window.setTimeout(flushLogs, 40)
+    if (logFlushTimer === undefined) logFlushTimer = window.setTimeout(flushLogs, 250)
     return
   }
   if (event.type === 'accounts') {
@@ -306,7 +346,7 @@ function handleAdminEvent(event: AdminEvent): void {
     accountTasks.value = event.data.tasks
     return
   }
-  replaceByID(requests.value, event.data)
+  requests.value = upsertRequest(requests.value, event.data)
 }
 
 // startConsole 加载全部管理数据并订阅管理事件
@@ -347,6 +387,7 @@ function stopConsole(): void {
 // useConsole 返回管理端共享的服务数据与操作
 export function useConsole() {
   return {
+    exitLookups,
     status,
     logs,
     accounts,
@@ -374,6 +415,7 @@ export function useConsole() {
     commitDelete,
     startService,
     stopService,
+    retryCamoufox,
     clearLogs,
     waitForRestart,
     startConsole,
